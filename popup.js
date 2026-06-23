@@ -77,5 +77,5 @@ document.getElementById('preview-btn').addEventListener('click', () => {
   if (scrapedData.issue_date) params.set('issue_date', scrapedData.issue_date);
   if (scrapedData.payment_method) params.set('payment_method', scrapedData.payment_method);
 
-  chrome.tabs.create({ url: `http://localhost:5042/api/invoice?${params.toString()}` });
+  chrome.tabs.create({ url: `http://192.168.0.161:5042/api/invoice?${params.toString()}` });
 });
