@@ -1,227 +1,176 @@
-// Booking Invoice — Content Script
-// Scrapes Booking.com reservation pages and sends data to local server.
+// Booking Invoice — Content Script v2
+// Scrapes Booking.com extranet reservation detail pages.
+// DOM structure: res-content__label / res-content__info pairs.
 
 (function () {
   'use strict';
 
-  // Don't inject twice
   if (document.getElementById('booking-invoice-btn')) return;
 
-  // ── Scraping ─────────────────────────────────────────────────────
+  // ── Helpers ─────────────────────────────────────────────────────
+
+  function cleanLabel(text) {
+    return text.replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function euroToFloat(text) {
+    // "€ 100,32" or "100,32 €" → 100.32
+    const m = text.match(/([\d\s,.]+)/);
+    if (!m) return NaN;
+    return parseFloat(m[1].replace(/\s/g, '').replace(',', '.'));
+  }
+
+  function parseBookingDate(text) {
+    // "mar. 16 juin 2026" or "mer. 9 juillet 2025"
+    const months = {
+      'janvier':'01','février':'02','mars':'03','avril':'04',
+      'mai':'05','juin':'06','juillet':'07','août':'08',
+      'septembre':'09','octobre':'10','novembre':'11','décembre':'12'
+    };
+    const m = text.match(/(\d{1,2})\s+(janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+(\d{4})/i);
+    if (m) {
+      return `${m[3]}-${months[m[2].toLowerCase()]}-${m[1].padStart(2, '0')}`;
+    }
+    return '';
+  }
+
+  // Scan all label/info pairs on the page
+  function getLabelValuePairs() {
+    const pairs = {};
+    const labels = document.querySelectorAll('.res-content__label');
+    for (const label of labels) {
+      const key = cleanLabel(label.textContent);
+      // Find the next info element (sibling or child of sibling)
+      let info = label.nextElementSibling;
+      // Sometimes the info is inside a parent grid cell
+      if (!info || !info.classList.contains('res-content__info')) {
+        const parent = label.closest('.bui-grid__column-full, .bui-grid__column-4\\@medium, .bui-grid__column-6\\@medium');
+        if (parent) {
+          info = parent.querySelector('.res-content__info');
+        }
+      }
+      if (info) {
+        const value = info.textContent.replace(/\s+/g, ' ').trim();
+        pairs[key] = value;
+      }
+    }
+    return pairs;
+  }
+
+  // ── Extraction ──────────────────────────────────────────────────
 
   function extractData() {
     const data = {};
+    const pairs = getLabelValuePairs();
 
-    // Try to extract from the page using multiple strategies
-
-    // --- Reservation number ---
-    // Strategy 1: Look for elements containing "confirmation" or "réservation"
-    const numSelectors = [
-      '[data-testid="reservation-number"]',
-      '.confirmation-number',
-      '.reservation-number',
-      '[class*="confirmation"] strong',
-      '[class*="reservation"] strong'
-    ];
-    for (const sel of numSelectors) {
-      const el = document.querySelector(sel);
-      if (el) { data.booking_ref = el.textContent.trim(); break; }
-    }
-    // Strategy 2: Parse from URL: /reservation/... or ?label=...
-    if (!data.booking_ref) {
-      const m = window.location.href.match(/(?:reservation|confirmation)[=/]([^?&]+)/i);
-      if (m) data.booking_ref = m[1];
-    }
-    // Strategy 3: Look for any bold number near "N°" or "#"
-    if (!data.booking_ref) {
-      const all = document.body.innerText;
-      const m = all.match(/(?:n[°º]|#)\s*(\d{6,12})/i);
-      if (m) data.booking_ref = m[1];
-    }
+    // --- Booking ref ---
+    data.booking_ref = pairs['numéro de réservation :'] || pairs['numéro de réservation'] || '';
 
     // --- Guest name ---
-    const guestSelectors = [
-      '[data-testid="guest-name"]',
-      '.guest-details .name',
-      '[class*="guest"] [class*="name"]',
-      'h3:contains("Client"), h4:contains("Client"), strong:contains("Client")'
-    ];
-    for (const sel of guestSelectors) {
-      try {
-        const el = document.querySelector(sel) || 
-                   [...document.querySelectorAll('*')].find(e => e.textContent.includes('Client') && e.tagName.match(/H[1-6]/));
-        if (el) {
-          // Try to get the name from a nearby element
-          const parent = el.closest('div,section,li');
-          if (parent) {
-            const text = parent.textContent.replace(/\s+/g, ' ').trim();
-            // Extract name: after "Client" or similar, before next section
-            const m = text.match(/(?:Client|Voyageur|Guest)[:\s]+([A-Z][a-zéèêëàâîïôûùç]+(?:\s+[A-Z][a-zéèêëàâîïôûùç]+)+)/i);
-            if (m) { data.guest_name = m[1]; break; }
-          }
+    // In header: "mar. 16 juin 2026 - 2 nuits - Delphine Marcellin"
+    const h1 = document.querySelector('h1');
+    if (h1) {
+      const parts = h1.textContent.split(' - ');
+      for (const part of parts) {
+        const name = part.trim();
+        // A name has 2-3 words, starts with uppercase, no digits
+        if (/^[A-Z][a-zéèêëàâîïôûùç]+\s+[A-Z][a-zéèêëàâîïôûùç]+/.test(name) && !/\d/.test(name)) {
+          data.guest_name = name;
+          break;
         }
-      } catch(e) {}
+      }
     }
-    // Fallback: look for common French name patterns near guest section
+
+    // Fallback: find anywhere "Client(s)" section
     if (!data.guest_name) {
-      const text = document.body.innerText;
-      const m = text.match(/(?:client|voyageur|guest|réservé par)[:\s]+([A-Z][a-zéèêëàâîïôûùç]+ [A-Z][a-zéèêëàâîïôûùç]+)/i);
-      if (m) data.guest_name = m[1];
-    }
-
-    // --- Property / Address ---
-    const propSelectors = [
-      '[data-testid="property-name"]',
-      '#hp_hotel_name',
-      'h1', 'h2'
-    ];
-    for (const sel of propSelectors) {
-      const el = document.querySelector(sel);
-      if (el && el.textContent.trim().length > 3 && el.textContent.trim().length < 200) {
-        data.description = el.textContent.trim();
-        break;
+      const els = document.querySelectorAll('[class*="guest"], [class*="client"]');
+      for (const el of els) {
+        const text = el.textContent.trim();
+        const m = text.match(/(?:Client|Voyageur|Guest)[:\s]+([A-Z][a-zéèêëàâîïôûùç]+ [A-Z][a-zéèêëàâîïôûùç]+)/i);
+        if (m) { data.guest_name = m[1]; break; }
       }
     }
 
-    // Try to find address
-    const addrSelectors = [
-      '[data-testid="property-address"]',
-      '.hp_address_subtitle',
-      '[class*="address"]'
-    ];
-    for (const sel of addrSelectors) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const addr = el.textContent.trim();
-        if (addr.length > 5) {
-          // Append address to description if not already there
-          if (!data.description.includes(addr.substring(0, 10))) {
-            data.description += ' — ' + addr;
-          }
-        }
-        break;
-      }
+    // --- Guest email ---
+    const emailDiv = document.querySelector('[email*="@guest.booking.com"]');
+    if (emailDiv) {
+      data.guest_email = emailDiv.getAttribute('email');
     }
 
     // --- Dates ---
-    // Strategy 1: date inputs
-    const checkinEl = document.querySelector('[data-testid="checkin-date"], [name="checkin"], #checkin, input[placeholder*="arrivée"], input[placeholder*="check-in"]');
-    const checkoutEl = document.querySelector('[data-testid="checkout-date"], [name="checkout"], #checkout, input[placeholder*="départ"], input[placeholder*="check-out"]');
-    if (checkinEl) data.checkin = checkinEl.value || checkinEl.textContent.trim();
-    if (checkoutEl) data.checkout = checkoutEl.value || checkoutEl.textContent.trim();
-
-    // Strategy 2: look for date patterns in the page text
-    if (!data.checkin || !data.checkout) {
-      const text = document.body.innerText;
-      // French date format: DD/MM/YYYY or DD month YYYY
-      const datePattern = /(\d{1,2}\s+(?:janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{4})/gi;
-      const dates = text.match(datePattern);
-      if (dates && dates.length >= 2) {
-        if (!data.checkin) data.checkin = parseDate(dates[0]);
-        if (!data.checkout) data.checkout = parseDate(dates[1]);
-      }
-    }
-
-    // Strategy 3: ISO dates in page
-    if (!data.checkin || !data.checkout) {
-      const isoDates = document.body.innerText.match(/\b(\d{4}-\d{2}-\d{2})\b/g);
-      if (isoDates && isoDates.length >= 2) {
-        if (!data.checkin) data.checkin = isoDates[0];
-        if (!data.checkout) data.checkout = isoDates[1];
-      }
-    }
+    data.checkin = parseBookingDate(pairs['date d\'arrivée'] || pairs['date d\'arrivée :'] || '');
+    data.checkout = parseBookingDate(pairs['date de départ'] || pairs['date de départ :'] || '');
 
     // --- Nights ---
-    if (data.checkin && data.checkout) {
+    const dureeStr = pairs['durée de séjour :'] || pairs['durée de séjour'] || '';
+    const nightsM = dureeStr.match(/(\d+)/);
+    if (nightsM) {
+      data.nights = parseInt(nightsM[1]);
+    }
+    if (!data.nights && data.checkin && data.checkout) {
       const ci = new Date(data.checkin);
       const co = new Date(data.checkout);
       if (!isNaN(ci) && !isNaN(co)) {
         data.nights = Math.round((co - ci) / (1000 * 60 * 60 * 24));
       }
     }
-    if (!data.nights) {
-      // Try to find in text
-      const m = document.body.innerText.match(/(\d+)\s*nuit/i);
-      if (m) data.nights = parseInt(m[1]);
+
+    // --- Total amount ---
+    const totalStr = pairs['montant total'] || pairs['montant total :'] || '';
+    const total = euroToFloat(totalStr);
+    if (!isNaN(total)) {
+      data.total_ttc = total;
     }
 
     // --- Price per night ---
-    // Look for price display elements
-    const priceEls = document.querySelectorAll('.bui-price-display__value, [class*="price"] [class*="value"], [class*="amount"]');
-    const prices = [];
-    for (const el of priceEls) {
-      const t = el.textContent.trim();
-      const m = t.match(/[\d\s,.]+/);
-      if (m) {
-        const val = parseFloat(m[0].replace(/\s/g, '').replace(',', '.'));
-        if (val > 1 && val < 10000) prices.push(val);
-      }
-    }
-    if (prices.length > 0) {
-      // The largest price is usually the total, medium is per night
-      prices.sort((a,b) => a-b);
-      data.rate_per_night = prices[0]; // Smallest is usually per-night
+    // Booking extranet doesn't always show per-night breakdown.
+    // Derive from total: total / nights (approximate TTC)
+    if (data.total_ttc && data.nights) {
+      // The total includes tourist tax, so this is approximate
+      data.rate_per_night = data.total_ttc / data.nights;
     }
 
     // --- Tourist tax ---
+    // Search the full page for tax de séjour mention
     const taxMatch = document.body.innerText.match(/(?:taxe\s*(?:de\s*)?s[ée]jour|tourist\s*tax)[:\s]*([\d\s,.]+)\s*[€$]/i);
     if (taxMatch) {
       data.taxe_sejour = parseFloat(taxMatch[1].replace(/\s/g, '').replace(',', '.'));
     }
 
-    // --- Total TTC ---
-    const totalSelectors = ['.bui-price-display__value', '[class*="total"] [class*="price"]'];
-    for (const sel of totalSelectors) {
-      const el = document.querySelector(sel);
-      if (el) {
-        const m = el.textContent.match(/[\d\s,.]+/);
-        if (m) {
-          const val = parseFloat(m[0].replace(/\s/g, '').replace(',', '.'));
-          if (val > 10 && (!data.rate_per_night || val > data.rate_per_night)) {
-            // Store total for reference
-            data.total_ttc = val;
-          }
+    // --- Property name ---
+    // In h1: "Au Chevaleins" — the first span before dates
+    if (h1) {
+      const spans = h1.querySelectorAll('span');
+      for (const span of spans) {
+        const t = span.textContent.trim();
+        // Property name: no digits, 3+ chars, not a date, not a name
+        if (t.length > 3 && !/\d/.test(t) && !/^\d/.test(t) &&
+            !/mar\.|lun\.|mer\.|jeu\.|ven\.|sam\.|dim\./i.test(t) &&
+            !/janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre/i.test(t)) {
+          data.description = t;
+          break;
         }
+      }
+    }
+
+    // Fallback: page title
+    if (!data.description) {
+      const title = document.title.replace('· Détails de la réservation', '').trim();
+      if (title && title.length > 3) {
+        data.description = title;
       }
     }
 
     // --- TVA ---
-    // Default to 10% for French seasonal rentals
-    data.tva_rate = 10;
-    // Try to find VAT info
-    const tvaMatch = document.body.innerText.match(/(?:TVA|VAT)[:\s]*(\d+[\.,]?\d*)\s*%/i);
-    if (tvaMatch) data.tva_rate = parseFloat(tvaMatch[1].replace(',', '.'));
+    data.tva_rate = 10; // default French seasonal rental
 
-    // --- Payment method ---
+    // --- Payment ---
     data.payment_method = 'Réservation Booking.com';
 
     // --- Issue date ---
-    const today = new Date();
-    data.issue_date = today.toISOString().split('T')[0];
+    data.issue_date = new Date().toISOString().split('T')[0];
 
     return data;
-  }
-
-  function parseDate(text) {
-    const months = {
-      'janvier': '01', 'février': '02', 'mars': '03', 'avril': '04',
-      'mai': '05', 'juin': '06', 'juillet': '07', 'août': '08',
-      'septembre': '09', 'octobre': '10', 'novembre': '11', 'décembre': '12',
-      'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05',
-      'jun': '06', 'jul': '07', 'aug': '08', 'sep': '09', 'oct': '10',
-      'nov': '11', 'dec': '12'
-    };
-    text = text.toLowerCase();
-    for (const [name, num] of Object.entries(months)) {
-      if (text.includes(name)) {
-        const m = text.match(/(\d{1,2})\s+/);
-        const y = text.match(/(\d{4})/);
-        if (m && y) {
-          return `${y[1]}-${num}-${m[1].padStart(2, '0')}`;
-        }
-      }
-    }
-    return '';
   }
 
   // ── UI: Floating button ──────────────────────────────────────────
@@ -256,28 +205,26 @@
   // ── Send to server ──────────────────────────────────────────────
 
   function showPreview(data) {
-    // Build URL with query params for the server
     const params = new URLSearchParams();
     if (data.booking_ref) params.set('booking_ref', data.booking_ref);
     if (data.guest_name) params.set('guest_name', data.guest_name);
+    if (data.guest_email) params.set('guest_email', data.guest_email);
     if (data.checkin) params.set('checkin', data.checkin);
     if (data.checkout) params.set('checkout', data.checkout);
     if (data.nights) params.set('nights', String(data.nights));
     if (data.description) params.set('description', data.description);
-    if (data.rate_per_night) params.set('rate_per_night', String(data.rate_per_night));
-    if (data.taxe_sejour) params.set('taxe_sejour', String(data.taxe_sejour));
+    if (data.rate_per_night) params.set('rate_per_night', data.rate_per_night.toFixed(2));
+    if (data.taxe_sejour) params.set('taxe_sejour', data.taxe_sejour.toFixed(2));
     if (data.tva_rate) params.set('tva_rate', String(data.tva_rate));
     if (data.issue_date) params.set('issue_date', data.issue_date);
     if (data.payment_method) params.set('payment_method', data.payment_method);
 
-    // Open preview in new tab
     const url = `http://localhost:5042/api/invoice?${params.toString()}`;
     window.open(url, '_blank');
   }
 
-  // ── Also expose for popup ──────────────────────────────────────
+  // ── Popup message handler ────────────────────────────────────────
 
-  // Listen for messages from popup
   chrome.runtime?.onMessage?.addListener((msg, sender, sendResponse) => {
     if (msg.action === 'scrape') {
       sendResponse(extractData());
