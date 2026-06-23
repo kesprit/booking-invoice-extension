@@ -115,12 +115,10 @@
 
     // --- Price table ---
     const table = roomBlock.querySelector('.res-room-block__table');
+    let rateDescription = '';
     if (table) {
       const rows = table.querySelectorAll('.bui-table__row');
-
-      // Collect per-night prices
       const nightlyRates = [];
-      let rateDescription = '';
 
       for (const row of rows) {
         const cells = row.querySelectorAll('.bui-table__cell');
